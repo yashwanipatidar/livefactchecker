@@ -1,97 +1,31 @@
-import os
-import math
-import re
-from collections import Counter
-from urllib.parse import urlparse
+from __future__ import annotations
+
 import logging
+import os
+from typing import Any
 
 from dotenv import load_dotenv
 
 from .models import EvidenceItem, VerificationResult
 
-
 logger = logging.getLogger(__name__)
 
-
-# Load the project .env explicitly (project root is parent of the app folder)
+# Load environment variables
 project_root = os.path.dirname(os.path.dirname(__file__))
 dotenv_path = os.path.join(project_root, ".env")
 load_dotenv(dotenv_path)
 
-SOURCE_SCORES = {
-    "un.org": 0.98,
-    "who.int": 0.98,
-    "worldbank.org": 0.95,
-    "nature.com": 0.95,
-    "wikipedia.org": 0.75,
-}
-
-DEFAULT_NLI_MODEL = os.getenv("NLI_MODEL_NAME", "microsoft/deberta-v3-large-mnli")
-NLI_LABELS = {
-    0: "CONTRADICTION",
-    1: "NEUTRAL",
-    2: "ENTAILMENT",
-}
-
-NEGATION_MARKERS = (
-    "false",
-    "not true",
-    "no evidence",
-    "refute",
-    "contradict",
-    "dispute",
-    "incorrect",
-    "misleading",
-    "debunk",
+DEFAULT_NLI_MODEL = os.getenv(
+    "NLI_MODEL_NAME",
+    "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
 )
 
-TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
 _nli_pipeline = None
 
 
-def _tokenize(text: str) -> list[str]:
-    return TOKEN_PATTERN.findall(text.lower())
-
-
-def _cosine_similarity(left_text: str, right_text: str) -> float:
-    left_tokens = Counter(_tokenize(left_text))
-    right_tokens = Counter(_tokenize(right_text))
-
-    if not left_tokens or not right_tokens:
-        return 0.0
-
-    shared_tokens = left_tokens.keys() & right_tokens.keys()
-    dot_product = sum(left_tokens[token] * right_tokens[token] for token in shared_tokens)
-
-    left_norm = math.sqrt(sum(value * value for value in left_tokens.values()))
-    right_norm = math.sqrt(sum(value * value for value in right_tokens.values()))
-
-    if not left_norm or not right_norm:
-        return 0.0
-
-    return dot_product / (left_norm * right_norm)
-
-
-def _extract_domain(url: str) -> str:
-    if not url:
-        return ""
-
-    parsed = urlparse(url)
-    return parsed.netloc.lower().removeprefix("www.")
-
-
-def _score_credibility(domain: str) -> float:
-    if not domain:
-        return 0.5
-
-    for trusted_domain, score in SOURCE_SCORES.items():
-        if domain == trusted_domain or domain.endswith(f".{trusted_domain}"):
-            return score
-
-    return 0.6
-
-
-def _get_nli_pipeline():
+def get_nli_pipeline():
     global _nli_pipeline
 
     if _nli_pipeline is not None:
@@ -99,289 +33,370 @@ def _get_nli_pipeline():
 
     try:
         from transformers import pipeline
-    except Exception:
-        _nli_pipeline = None
-        return None
 
-    try:
+        logger.info(
+            "Loading local NLI model: %s",
+            DEFAULT_NLI_MODEL
+        )
+
         _nli_pipeline = pipeline(
             task="text-classification",
             model=DEFAULT_NLI_MODEL,
             tokenizer=DEFAULT_NLI_MODEL,
             top_k=None,
         )
+
+        return _nli_pipeline
+
     except Exception:
-        _nli_pipeline = None
+        logger.exception(
+            "Failed to load local NLI model"
+        )
 
-    return _nli_pipeline
+        return None
 
 
-def _normalize_scores(scores: list[dict]) -> dict[str, float]:
-    normalized: dict[str, float] = {}
+def normalize_scores(
+    scores: list[dict[str, Any]]
+) -> dict[str, float]:
+
+    normalized = {
+        "entailment": 0.0,
+        "contradiction": 0.0,
+        "neutral": 0.0,
+    }
 
     for item in scores:
-        label = str(item.get("label", "")).upper()
-        score = float(item.get("score", 0.0))
+
+        label = str(
+            item.get("label", "")
+        ).upper()
+
+        score = float(
+            item.get("score", 0.0)
+        )
 
         if "ENTAIL" in label:
             normalized["entailment"] = score
+
         elif "CONTRAD" in label:
             normalized["contradiction"] = score
+
         elif "NEUTRAL" in label:
             normalized["neutral"] = score
 
     return normalized
 
 
-def _score_with_nli(claim: str, evidence: EvidenceItem) -> dict:
-    # Try Hugging Face Inference API first (remote), then local transformers pipeline, then heuristic.
-    evidence_text = f"{evidence.title}\n{evidence.content}".strip()
-    logger.debug("Scoring evidence NLI for claim snippet: %s", (claim or '')[:120])
+def score_with_hf_api(
+    premise: str,
+    hypothesis: str,
+) -> dict[str, float] | None:
 
-    def _nli_with_hf(claim_text: str, evidence_text: str, model: str | None = None) -> dict | None:
-        hf_token = os.environ.get("HF_TOKEN")
-        if not hf_token:
-            logger.debug("HF_TOKEN not set; skipping Hugging Face InferenceClient path")
-            return None
+    if not HF_TOKEN:
+        return None
 
-        try:
-            from huggingface_hub import InferenceClient
-        except Exception:
-            logger.exception("Failed to import huggingface_hub.InferenceClient; ensure huggingface-hub is installed")
-            return None
+    try:
 
-        try:
-            client = InferenceClient(provider="hf-inference", api_key=hf_token)
-            # Prefer structured inputs for NLI if supported
-            try:
-                payload = {"inputs": {"premise": evidence_text, "hypothesis": claim_text}}
-                resp = client.text_classification(payload, model=model or DEFAULT_NLI_MODEL)
-            except Exception:
-                # Fallback to simple concatenated text
-                text = f"premise: {evidence_text}\nhypothesis: {claim_text}"
-                resp = client.text_classification(text, model=model or DEFAULT_NLI_MODEL)
-        except Exception:
-            logger.exception("Hugging Face InferenceClient call failed")
-            return None
+        from huggingface_hub import InferenceClient
 
-        logger.debug("Hugging Face inference response type=%s", type(resp))
-        # Normalize response
-        scores_map: dict[str, float] = {}
-        if isinstance(resp, list):
-            for r in resp:
-                if isinstance(r, dict) and "label" in r:
-                    scores_map[str(r.get("label", "")).upper()] = float(r.get("score", 0.0))
-        elif isinstance(resp, dict) and "label" in resp:
-            scores_map[str(resp.get("label", "")).upper()] = float(resp.get("score", 0.0))
-        else:
-            return None
+        client = InferenceClient(
+            api_key=HF_TOKEN
+        )
 
-        entailment_score = scores_map.get("ENTAILMENT", scores_map.get("ENTAIL", 0.0))
-        contradiction_score = scores_map.get("CONTRADICTION", scores_map.get("CONTRAD", 0.0))
-        neutral_score = scores_map.get("NEUTRAL", 0.0)
+        text = (
+            f"premise: {premise}\n"
+            f"hypothesis: {hypothesis}"
+        )
 
-        similarity = _cosine_similarity(claim_text, evidence_text)
-        credibility_score = _score_credibility(evidence.domain or _extract_domain(evidence.url))
+        response = client.text_classification(
+            text,
+            model=DEFAULT_NLI_MODEL,
+        )
 
-        label = max(scores_map, key=scores_map.get) if scores_map else ""
+        scores = {}
+
+        if isinstance(response, list):
+
+            for item in response:
+
+                scores[
+                    item["label"].upper()
+                ] = float(
+                    item["score"]
+                )
+
+        entailment = scores.get(
+            "ENTAILMENT",
+            0.0,
+        )
+
+        contradiction = scores.get(
+            "CONTRADICTION",
+            0.0,
+        )
+
+        neutral = scores.get(
+            "NEUTRAL",
+            0.0,
+        )
 
         return {
-            "relevance_score": max(similarity, entailment_score),
-            "similarity_score": similarity,
-            "entailment_score": entailment_score,
-            "contradiction_score": contradiction_score,
-            "credibility_score": credibility_score,
-            "verification_mode": "hf-inference",
-            "nli_label": label,
-            "nli_scores": {
-                "entailment": entailment_score,
-                "contradiction": contradiction_score,
-                "neutral": neutral_score,
-            },
+            "entailment": entailment,
+            "contradiction": contradiction,
+            "neutral": neutral,
         }
 
-    # Try HF inference first
-    try:
-        hf_result = _nli_with_hf(claim, evidence_text)
-        if hf_result is not None:
-            logger.info("Using Hugging Face Inference API for NLI")
-            return hf_result
     except Exception:
-        logger.exception("Unexpected error in HF inference path; falling back")
 
-    # Try local transformers pipeline
-    nli = _get_nli_pipeline()
-    if nli is None:
-        logger.info("No local transformers pipeline available; using heuristic fallback")
-        return _score_evidence_pair(claim, evidence) | {"verification_mode": "heuristic", "nli_label": "", "nli_scores": {}}
+        logger.exception(
+            "HF inference failed"
+        )
 
-    try:
-        raw_scores = nli({"text": claim, "text_pair": evidence_text})
-    except Exception:
-        logger.exception("Local transformers NLI pipeline failed; falling back to heuristic")
-        return _score_evidence_pair(claim, evidence) | {"verification_mode": "heuristic", "nli_label": "", "nli_scores": {}}
-
-    if raw_scores and isinstance(raw_scores, list) and raw_scores and isinstance(raw_scores[0], list):
-        score_list = raw_scores[0]
-    else:
-        score_list = raw_scores if isinstance(raw_scores, list) else []
-
-    normalized = _normalize_scores(score_list)
-    entailment_score = normalized.get("entailment", 0.0)
-    contradiction_score = normalized.get("contradiction", 0.0)
-    neutral_score = normalized.get("neutral", max(0.0, 1.0 - entailment_score - contradiction_score))
-
-    similarity = _cosine_similarity(claim, evidence_text)
-    credibility_score = _score_credibility(evidence.domain or _extract_domain(evidence.url))
-
-    return {
-        "relevance_score": max(similarity, entailment_score),
-        "similarity_score": similarity,
-        "entailment_score": entailment_score,
-        "contradiction_score": contradiction_score,
-        "credibility_score": credibility_score,
-        "verification_mode": "nli",
-        "nli_label": max(normalized, key=normalized.get).upper() if normalized else "",
-        "nli_scores": {
-            "entailment": entailment_score,
-            "contradiction": contradiction_score,
-            "neutral": neutral_score,
-        },
-    }
+        return None
 
 
-def _score_evidence_pair(claim: str, evidence: EvidenceItem) -> dict:
-    evidence_text = f"{evidence.title}\n{evidence.content}".strip()
-    similarity = _cosine_similarity(claim, evidence_text)
+def score_evidence(
+    claim: str,
+    evidence: EvidenceItem,
+) -> dict[str, Any]:
 
-    content = evidence_text.lower()
-    contradiction_hint = any(marker in content for marker in NEGATION_MARKERS)
-    contradiction_score = min(1.0, similarity * 0.45 + (0.45 if contradiction_hint else 0.0))
+    premise = evidence.content
+    hypothesis = claim
 
-    credibility_score = _score_credibility(evidence.domain or _extract_domain(evidence.url))
-    entailment_score = min(1.0, (similarity * 0.7) + (credibility_score * 0.3))
+    # HF API first
+    scores = score_with_hf_api(
+        premise,
+        hypothesis,
+    )
 
-    return {
-        "relevance_score": similarity,
-        "similarity_score": similarity,
-        "entailment_score": entailment_score,
-        "contradiction_score": contradiction_score,
-        "credibility_score": credibility_score,
-        "verification_mode": "heuristic",
-        "nli_label": "",
-        "nli_scores": {},
-    }
+    if scores is not None:
 
+        entailment = scores["entailment"]
+        contradiction = scores["contradiction"]
+        neutral = scores["neutral"]
 
-def _aggregate_scores(scored_evidence: list[EvidenceItem]) -> dict:
-    if not scored_evidence:
+        label = max(
+            scores,
+            key=scores.get,
+        ).upper()
+
         return {
-            "similarity_score": 0.0,
+            "entailment_score": entailment,
+            "contradiction_score": contradiction,
+            "neutral_score": neutral,
+            "nli_label": label,
+            "nli_scores": scores,
+            "verification_mode": "hf-inference",
+        }
+
+    # Local fallback
+    pipeline = get_nli_pipeline()
+
+    if pipeline is None:
+
+        return {
             "entailment_score": 0.0,
             "contradiction_score": 0.0,
-            "credibility_score": 0.0,
+            "neutral_score": 0.0,
+            "nli_label": "",
+            "nli_scores": {},
+            "verification_mode": "unavailable",
         }
 
-    similarity_score = max(item.relevance_score for item in scored_evidence)
-    entailment_score = max(item.entailment_score for item in scored_evidence)
-    contradiction_score = max(
-        min(1.0, item.relevance_score * 0.45 + (0.45 if "not" in f"{item.title} {item.content}".lower() else 0.0))
-        for item in scored_evidence
-    )
-    credibility_score = sum(item.credibility_score for item in scored_evidence) / len(scored_evidence)
+    try:
 
-    return {
-        "similarity_score": similarity_score,
-        "entailment_score": entailment_score,
-        "contradiction_score": contradiction_score,
-        "credibility_score": credibility_score,
-    }
+        result = pipeline(
+            {
+                "text": premise,
+                "text_pair": hypothesis,
+            }
+        )
+
+        if (
+            isinstance(result, list)
+            and len(result) > 0
+            and isinstance(result[0], list)
+        ):
+            result = result[0]
+
+        normalized = normalize_scores(
+            result
+        )
+
+        label = max(
+            normalized,
+            key=normalized.get,
+        ).upper()
+
+        return {
+            "entailment_score":
+                normalized["entailment"],
+
+            "contradiction_score":
+                normalized["contradiction"],
+
+            "neutral_score":
+                normalized["neutral"],
+
+            "nli_label": label,
+
+            "nli_scores": normalized,
+
+            "verification_mode": "local-nli",
+        }
+
+    except Exception:
+
+        logger.exception(
+            "Local NLI scoring failed"
+        )
+
+        return {
+            "entailment_score": 0.0,
+            "contradiction_score": 0.0,
+            "neutral_score": 0.0,
+            "nli_label": "",
+            "nli_scores": {},
+            "verification_mode": "error",
+        }
 
 
-def _build_explanation(verdict: str, scored_evidence: list[EvidenceItem], metrics: dict) -> str:
-    if not scored_evidence:
-        return "No evidence was available to support a decision."
+def verify_claim(
+    claim: str,
+    evidence_items: list[EvidenceItem],
+) -> dict[str, Any]:
 
-    top_sources = [item.domain or _extract_domain(item.url) or item.url for item in scored_evidence[:3] if (item.url or item.domain)]
-    source_text = ", ".join(filter(None, top_sources))
-
-    if verdict == "TRUE":
-        prefix = "The strongest evidence supports the claim"
-    elif verdict == "FALSE":
-        prefix = "The strongest evidence contradicts the claim"
-    else:
-        prefix = "The available evidence is mixed and does not support a confident binary verdict"
-
-    return (
-        f"{prefix}. "
-        f"Top evidence sources: {source_text or 'n/a'}. "
-        f"Similarity={metrics['similarity_score']:.2f}, "
-        f"Credibility={metrics['credibility_score']:.2f}, "
-        f"Contradiction={metrics['contradiction_score']:.2f}."
-    )
-
-
-def verify_claim(claim: str, evidence_items: list[EvidenceItem]):
     if not evidence_items:
+
         return VerificationResult(
             verdict="UNVERIFIED",
             confidence=0,
-            explanation="No supporting evidence found.",
+            explanation="No evidence found.",
         ).model_dump()
 
-    scored_evidence: list[EvidenceItem] = []
+    scored_evidence: list[
+        EvidenceItem
+    ] = []
+
     for item in evidence_items:
-        scores = _score_with_nli(claim, item)
-        scored_evidence.append(
-            item.model_copy(update=scores)
+
+        scores = score_evidence(
+            claim,
+            item,
         )
 
-    scored_evidence.sort(key=lambda item: item.relevance_score, reverse=True)
-    metrics = _aggregate_scores(scored_evidence)
+        updated = item.model_copy(
+            update={
+                "entailment_score":
+                    scores["entailment_score"],
 
-    best_entailment = max(item.entailment_score for item in scored_evidence)
-    best_contradiction = max(item.contradiction_score for item in scored_evidence)
-    best_similarity = max(item.relevance_score for item in scored_evidence)
-    average_credibility = metrics["credibility_score"]
+                "contradiction_score":
+                    scores["contradiction_score"],
 
-    if best_contradiction >= 0.80 and best_contradiction > best_entailment:
-        verdict = "FALSE"
-    elif best_entailment >= 0.72 and best_similarity >= 0.55:
+                "neutral_score":
+                    scores["neutral_score"],
+
+                "nli_label":
+                    scores["nli_label"],
+
+                "nli_scores":
+                    scores["nli_scores"],
+
+                "verification_mode":
+                    scores["verification_mode"],
+            }
+        )
+
+        scored_evidence.append(
+            updated
+        )
+
+    support_avg = sum(
+        item.entailment_score
+        for item in scored_evidence
+    ) / len(scored_evidence)
+
+    contradiction_avg = sum(
+        item.contradiction_score
+        for item in scored_evidence
+    ) / len(scored_evidence)
+
+    neutral_avg = sum(
+        item.neutral_score
+        for item in scored_evidence
+    ) / len(scored_evidence)
+
+    relevance_avg = sum(
+        item.relevance_score
+        for item in scored_evidence
+    ) / len(scored_evidence)
+
+    # Verdict Logic
+    if (
+        support_avg > 0.80
+        and support_avg >
+        contradiction_avg + 0.15
+    ):
         verdict = "TRUE"
+
+    elif (
+        contradiction_avg > 0.80
+        and contradiction_avg >
+        support_avg + 0.15
+    ):
+        verdict = "FALSE"
+
     else:
         verdict = "MISLEADING"
 
     confidence = int(
         round(
-            100
-            * (
-                best_entailment * 0.5
-                + best_similarity * 0.3
-                + average_credibility * 0.2
+            100 * max(
+                0.0,
+                (
+                    support_avg
+                    - contradiction_avg
+                    + relevance_avg
+                ) / 2
             )
         )
     )
 
-    # Prefer explicit hf-inference if any evidence used it, then local nli, else heuristic
-    if any(getattr(item, "verification_mode", "") == "hf-inference" for item in scored_evidence):
-        verification_mode = "hf-inference"
-    elif any(getattr(item, "nli_scores", {}) for item in scored_evidence):
-        verification_mode = "nli"
-    else:
-        verification_mode = "heuristic"
-
-    logger.info("Verification mode=%s entailment=%.3f contradiction=%.3f similarity=%.3f", verification_mode, best_entailment, best_contradiction, best_similarity)
+    confidence = min(
+        100,
+        max(
+            0,
+            confidence,
+        ),
+    )
 
     return VerificationResult(
         verdict=verdict,
-        confidence=max(0, min(100, confidence)),
-        explanation=_build_explanation(verdict, scored_evidence, metrics),
-        verification_mode=verification_mode,
-        similarity_score=best_similarity,
-        entailment_score=best_entailment,
-        contradiction_score=best_contradiction,
-        credibility_score=average_credibility,
-        nli_label=(scored_evidence[0].nli_label if scored_evidence else ""),
-        nli_scores=(scored_evidence[0].nli_scores if scored_evidence else {}),
+        confidence=confidence,
+        explanation="",
+        evidence_summary="",
+        reasoning="",
+        verification_mode=(
+            scored_evidence[0]
+            .verification_mode
+            if scored_evidence
+            else "nli"
+        ),
+        similarity_score=relevance_avg,
+        entailment_score=support_avg,
+        contradiction_score=contradiction_avg,
+        neutral_score=neutral_avg,
+        credibility_score=0.0,
+        nli_label=(
+            scored_evidence[0].nli_label
+            if scored_evidence
+            else ""
+        ),
+        nli_scores=(
+            scored_evidence[0].nli_scores
+            if scored_evidence
+            else {}
+        ),
         evidence=scored_evidence,
     ).model_dump()

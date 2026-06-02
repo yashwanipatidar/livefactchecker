@@ -1,0 +1,612 @@
+#gemini_client.py
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+# Attempt to import google.generativeai; fall back gracefully
+_genai = None
+try:
+    import google.generativeai as genai
+    _genai = genai
+except Exception:
+    _genai = None
+
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if _genai is not None and GEMINI_API_KEY:
+    try:
+        _genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        logger.exception("Failed to configure google.generativeai")
+
+
+def generate_explanation(claim: str, top_chunks: List[Dict[str, Any]], verdict: str, nli_summary: Dict[str, float], max_output_tokens: int = 256) -> Dict[str, str]:
+    """Generate explanation, evidence summary and reasoning using Gemini 2.5 Flash.
+
+    This function will NOT decide the verdict; it only generates human-facing text.
+    If Gemini is unavailable, returns a deterministic fallback summary.
+    """
+    prompt_chunks = []
+    for c in top_chunks:
+        src = c.get("url") or c.get("domain") or "source"
+        prompt_chunks.append(f"Source: {src}\nText: {c.get('content')}")
+
+    system_message = (
+        "You are a helpful assistant that summarizes evidence and explains reasoning. "
+        "Do not change or decide the verdict; only produce an explanation consistent with the provided verdict and NLI scores."
+    )
+
+    user_prompt = (
+        f"Claim: {claim}\n"
+        f"Verdict: {verdict}\n"
+        f"NLI summary: support={nli_summary.get('support', 0.0):.3f}, contradiction={nli_summary.get('contradiction', 0.0):.3f}\n"
+        "Top evidence chunks:\n"
+        + "\n---\n".join(prompt_chunks)
+        + "\n\nProvide:\n1) A short explanation sentence for the verdict.\n2) A concise evidence summary (bulleted).\n3) A short reasoning paragraph describing how the NLI scores support the verdict."
+    )
+
+    if _genai is None:
+        logger.warning("google.generativeai not available; using fallback explanation generator")
+        # Fallback deterministic generator
+        explanation = f"Verdict: {verdict}. Top evidence sources: {', '.join([c.get('url') or c.get('domain') or '' for c in top_chunks][:3])}."
+        evidence_summary_lines = []
+        for c in top_chunks[:3]:
+            evidence_summary_lines.append(f"- {c.get('content')[:200].replace('\n',' ')} ({c.get('url') or c.get('domain') or 'n/a'})")
+        evidence_summary = "\n".join(evidence_summary_lines)
+        reasoning = f"Support={nli_summary.get('support',0):.2f}, Contradiction={nli_summary.get('contradiction',0):.2f}."
+        return {"explanation": explanation, "evidence_summary": evidence_summary, "reasoning": reasoning}
+
+    # When gemini client is available, call the model
+    try:
+        resp = _genai.generate(
+            model="gemini-2.5-flash",
+            prompt=f"{system_message}\n\n{user_prompt}",
+            max_output_tokens=max_output_tokens,
+        )
+        # Extract text from response; genai may return dict with 'candidates'
+        text = ""
+        if isinstance(resp, dict):
+            # Different client versions vary; try common keys
+            if "candidates" in resp and resp["candidates"]:
+                text = resp["candidates"][0].get("content", "")
+            elif "content" in resp:
+                text = resp.get("content", "")
+        else:
+            text = str(resp)
+
+        # Basic split heuristics into parts
+        parts = text.split('\n\n')
+        explanation = parts[0].strip() if parts else text.strip()
+        evidence_summary = parts[1].strip() if len(parts) > 1 else ""
+        reasoning = parts[2].strip() if len(parts) > 2 else ""
+
+        return {"explanation": explanation, "evidence_summary": evidence_summary, "reasoning": reasoning}
+    except Exception:
+        logger.exception("Gemini generation failed; returning fallback explanation")
+        explanation = f"Verdict: {verdict}. Top evidence sources: {', '.join([c.get('url') or c.get('domain') or '' for c in top_chunks][:3])}."
+        evidence_summary = "\n".join([f"- {c.get('content')[:200]}" for c in top_chunks[:3]])
+        reasoning = f"Support={nli_summary.get('support',0):.2f}, Contradiction={nli_summary.get('contradiction',0):.2f}."
+        return {"explanation": explanation, "evidence_summary": evidence_summary, "reasoning": reasoning}
+
+
+#models.py
+from pydantic import BaseModel, Field
+
+class ClaimRequest(BaseModel):
+    claim: str
+
+
+class EvidenceItem(BaseModel):
+    title: str = ""
+    content: str = ""
+    url: str = ""
+    domain: str = ""
+    relevance_score: float = 0.0
+    credibility_score: float = 0.0
+    # Per-evidence NLI/scoring fields (populated by verifier)
+    similarity_score: float = 0.0
+    entailment_score: float = 0.0
+    contradiction_score: float = 0.0
+    nli_label: str = ""
+    nli_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class VerificationResult(BaseModel):
+    verdict: str
+    confidence: int
+    explanation: str
+    verification_mode: str = "heuristic"
+    similarity_score: float = 0.0
+    entailment_score: float = 0.0
+    contradiction_score: float = 0.0
+    credibility_score: float = 0.0
+    nli_label: str = ""
+    nli_scores: dict[str, float] = Field(default_factory=dict)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+
+class ClaimResponse(BaseModel):
+    verdict: str
+    explanation: str
+    confidence: int
+    verification_mode: str = "heuristic"
+    sources: list[str] = Field(default_factory=list)
+    similarity_score: float = 0.0
+    entailment_score: float = 0.0
+    contradiction_score: float = 0.0
+    credibility_score: float = 0.0
+    nli_label: str = ""
+    nli_scores: dict[str, float] = Field(default_factory=dict)
+
+
+
+#rag.py
+from .retriever import retrieve_relevant_context
+from .tavily_client import search_evidence
+from .verifier import verify_claim
+
+def fact_check(claim: str):
+
+    evidence = search_evidence(claim)
+    ranked_evidence = retrieve_relevant_context(claim, evidence)
+
+    result = verify_claim(
+        claim,
+        ranked_evidence
+    )
+
+    result["sources"] = [item.url for item in ranked_evidence if item.url]
+
+    return result
+
+#retriever.py
+from __future__ import annotations
+
+import logging
+import math
+from typing import List, Dict, Any
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+from .models import EvidenceItem
+
+logger = logging.getLogger(__name__)
+
+# Embedding model singleton
+_embed_model: SentenceTransformer | None = None
+
+
+def _get_embed_model(model_name: str = "BAAI/bge-base-en-v1.5") -> SentenceTransformer:
+    global _embed_model
+    if _embed_model is None:
+        logger.info("Loading embedding model %s", model_name)
+        _embed_model = SentenceTransformer(model_name)
+    return _embed_model
+
+
+def chunk_text(text: str, chunk_size: int = 400) -> List[str]:
+    if not text:
+        return []
+
+    chunks: List[str] = []
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i : i + chunk_size].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _cosine_sim_vectors(a: np.ndarray, b: np.ndarray) -> float:
+    if a is None or b is None:
+        return 0.0
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def embed_texts(texts: List[str], model_name: str = "BAAI/bge-base-en-v1.5") -> np.ndarray:
+    model = _get_embed_model(model_name)
+    return model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+
+
+def retrieve_relevant_context(
+    claim: str,
+    evidence_items: List[EvidenceItem],
+    chunk_size: int = 400,
+    top_k: int = 5,
+    embed_model_name: str = "BAAI/bge-base-en-v1.5",
+) -> List[EvidenceItem]:
+    """Perform semantic retrieval by chunking evidence, embedding chunks and the claim, and
+    returning the top_k most relevant evidence chunks as EvidenceItem instances.
+    Each returned EvidenceItem will have `content` set to the chunk text and `relevance_score` set.
+    """
+    if not evidence_items:
+        return []
+
+    # Build chunks with metadata
+    chunk_records: List[Dict[str, Any]] = []
+    for item in evidence_items:
+        text = f"{item.title}\n{item.content}".strip()
+        for chunk in chunk_text(text, chunk_size=chunk_size):
+            chunk_records.append(
+                {
+                    "title": item.title,
+                    "url": item.url,
+                    "domain": item.domain,
+                    "chunk": chunk,
+                }
+            )
+
+    if not chunk_records:
+        return []
+
+    # Embed claim and chunks
+    try:
+        logger.debug("Embedding %d chunks for retrieval", len(chunk_records))
+        chunk_texts = [r["chunk"] for r in chunk_records]
+        chunk_embeddings = embed_texts(chunk_texts, model_name=embed_model_name)
+        claim_emb = embed_texts([claim], model_name=embed_model_name)[0]
+    except Exception:
+        logger.exception("Embedding failed; returning original ranked documents by fallback")
+        # Fallback: return original items with zero scores
+        return [e.model_copy(update={"relevance_score": 0.0}) for e in evidence_items]
+
+    # Score chunks
+    scored = []
+    for rec, emb in zip(chunk_records, chunk_embeddings):
+        sim = _cosine_sim_vectors(claim_emb, emb)
+        scored.append({**rec, "similarity": sim})
+
+    # Rank and keep top_k chunks
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    top_chunks = scored[:top_k]
+
+    results: List[EvidenceItem] = []
+    for c in top_chunks:
+        results.append(
+            EvidenceItem(
+                title=c.get("title", ""),
+                content=c.get("chunk", ""),
+                url=c.get("url", ""),
+                domain=c.get("domain", ""),
+                relevance_score=float(c.get("similarity", 0.0)),
+            )
+        )
+
+    return results
+
+
+#routes.py
+from fastapi import APIRouter
+from .models import ClaimRequest, ClaimResponse
+from .rag import fact_check as run_fact_check
+
+router = APIRouter()
+
+@router.post("/fact-check", response_model=ClaimResponse)
+def fact_check(request: ClaimRequest):
+    return run_fact_check(request.claim)
+
+
+#tavily_client.py
+import os
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
+
+from .models import EvidenceItem
+
+
+# Load the project .env explicitly
+project_root = os.path.dirname(os.path.dirname(__file__))
+dotenv_path = os.path.join(project_root, ".env")
+load_dotenv(dotenv_path)
+
+api_key = os.getenv("TAVILY_API_KEY")
+client = TavilyClient(api_key=api_key) if (api_key and TavilyClient is not None) else None
+
+
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+    return parsed.netloc.lower().removeprefix("www.")
+
+def search_evidence(claim: str):
+
+    if client is None:
+        return []
+
+    try:
+        response = client.search(
+            query=claim,
+            search_depth="advanced",
+            max_results=5
+        )
+    except Exception:
+        return []
+
+    evidence: list[EvidenceItem] = []
+
+    for result in response["results"]:
+        url = result.get("url", "")
+        evidence.append(
+            EvidenceItem(
+                title=result.get("title", ""),
+                content=result.get("content", ""),
+                url=url,
+                domain=_extract_domain(url),
+            )
+        )
+
+    return evidence
+
+#verifier.py
+from __future__ import annotations
+
+import logging
+import os
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from .models import EvidenceItem, VerificationResult
+
+logger = logging.getLogger(__name__)
+
+# Load env
+project_root = os.path.dirname(os.path.dirname(__file__))
+dotenv_path = os.path.join(project_root, ".env")
+load_dotenv(dotenv_path)
+
+DEFAULT_NLI_MODEL = os.getenv("NLI_MODEL_NAME", "microsoft/deberta-v3-large-mnli")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# Pipeline singleton
+_nli_pipeline = None
+
+
+def _get_nli_pipeline(model_name: str = DEFAULT_NLI_MODEL):
+    global _nli_pipeline
+    if _nli_pipeline is not None:
+        return _nli_pipeline
+
+    try:
+        from transformers import pipeline
+    except Exception:
+        logger.exception("transformers not available; NLI pipeline cannot be loaded")
+        _nli_pipeline = None
+        return None
+
+    try:
+        logger.info("Loading NLI pipeline: %s", model_name)
+        _nli_pipeline = pipeline(
+            task="text-classification",
+            model=model_name,
+            tokenizer=model_name,
+            top_k=None,
+        )
+    except Exception:
+        logger.exception("Failed to load NLI pipeline")
+        _nli_pipeline = None
+
+    return _nli_pipeline
+
+
+def _normalize_scores(scores: List[Dict[str, Any]]) -> Dict[str, float]:
+    normalized: Dict[str, float] = {"entailment": 0.0, "contradiction": 0.0, "neutral": 0.0}
+    for item in scores:
+        label = str(item.get("label", "")).upper()
+        score = float(item.get("score", 0.0))
+        if "ENTAIL" in label:
+            normalized["entailment"] = score
+        elif "CONTRAD" in label or "CONTRADI" in label:
+            normalized["contradiction"] = score
+        elif "NEUTRAL" in label:
+            normalized["neutral"] = score
+    return normalized
+
+
+def _nli_with_hf(premise: str, hypothesis: str, model: str | None = None) -> Dict[str, Any] | None:
+    if not HF_TOKEN:
+        return None
+    try:
+        from huggingface_hub import InferenceClient
+    except Exception:
+        logger.exception("huggingface_hub not installed; HF inference client unavailable")
+        return None
+
+    try:
+        client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+        # structured inputs
+        payload = {"inputs": {"premise": premise, "hypothesis": hypothesis}}
+        resp = client.text_classification(payload, model=model or DEFAULT_NLI_MODEL)
+    except Exception:
+        logger.exception("Hugging Face Inference API call failed")
+        return None
+
+    # Normalize response
+    scores_map: Dict[str, float] = {}
+    if isinstance(resp, list):
+        for r in resp:
+            if isinstance(r, dict) and "label" in r:
+                scores_map[str(r.get("label", "")).upper()] = float(r.get("score", 0.0))
+    elif isinstance(resp, dict) and "label" in resp:
+        scores_map[str(resp.get("label", "")).upper()] = float(resp.get("score", 0.0))
+    else:
+        return None
+
+    entail = scores_map.get("ENTAILMENT", scores_map.get("ENTAIL", 0.0))
+    contrad = scores_map.get("CONTRADICTION", scores_map.get("CONTRAD", 0.0))
+    neutral = scores_map.get("NEUTRAL", 0.0)
+
+    return {
+        "entailment": float(entail),
+        "contradiction": float(contrad),
+        "neutral": float(neutral),
+    }
+
+
+def _score_with_nli(claim: str, evidence: EvidenceItem, model_name: str = DEFAULT_NLI_MODEL) -> Dict[str, Any]:
+    """Score a single evidence chunk using NLI. Premise = evidence.content, Hypothesis = claim."""
+    premise = evidence.content
+    hypothesis = claim
+
+    # Try HF inference API first
+    try:
+        hf_scores = _nli_with_hf(premise, hypothesis, model=model_name)
+        if hf_scores is not None:
+            logger.debug("Using HF Inference for NLI")
+            entail = hf_scores.get("entailment", 0.0)
+            contrad = hf_scores.get("contradiction", 0.0)
+            neutral = hf_scores.get("neutral", 0.0)
+            return {
+                "entailment_score": float(entail),
+                "contradiction_score": float(contrad),
+                "neutral_score": float(neutral),
+                "nli_label": (
+                    "ENTAILMENT" if entail >= max(contrad, neutral) else ("CONTRADICTION" if contrad >= max(entail, neutral) else "NEUTRAL")
+                ),
+                "nli_scores": {"entailment": float(entail), "contradiction": float(contrad), "neutral": float(neutral)},
+                "verification_mode": "hf-inference",
+            }
+    except Exception:
+        logger.exception("HF inference failed; falling back to local pipeline")
+
+    # Local transformers pipeline
+    nli = _get_nli_pipeline(model_name)
+    if nli is None:
+        logger.error("No NLI pipeline available; returning zeros")
+        return {
+            "entailment_score": 0.0,
+            "contradiction_score": 0.0,
+            "neutral_score": 0.0,
+            "nli_label": "",
+            "nli_scores": {},
+            "verification_mode": "unavailable",
+        }
+
+    try:
+        # premise first, hypothesis second to align with requirement
+        raw = nli({"text": premise, "text_pair": hypothesis})
+    except Exception:
+        logger.exception("Local NLI pipeline call failed")
+        return {
+            "entailment_score": 0.0,
+            "contradiction_score": 0.0,
+            "neutral_score": 0.0,
+            "nli_label": "",
+            "nli_scores": {},
+            "verification_mode": "error",
+        }
+
+    # Normalize transformer output
+    if raw and isinstance(raw, list) and raw and isinstance(raw[0], list):
+        score_list = raw[0]
+    else:
+        score_list = raw if isinstance(raw, list) else []
+
+    normalized = _normalize_scores(score_list)
+    entail = normalized.get("entailment", 0.0)
+    contrad = normalized.get("contradiction", 0.0)
+    neutral = normalized.get("neutral", max(0.0, 1.0 - entail - contrad))
+
+    label = ""
+    if entail >= max(contrad, neutral):
+        label = "ENTAILMENT"
+    elif contrad >= max(entail, neutral):
+        label = "CONTRADICTION"
+    else:
+        label = "NEUTRAL"
+
+    return {
+        "entailment_score": float(entail),
+        "contradiction_score": float(contrad),
+        "neutral_score": float(neutral),
+        "nli_label": label,
+        "nli_scores": {"entailment": float(entail), "contradiction": float(contrad), "neutral": float(neutral)},
+        "verification_mode": "nli",
+    }
+
+
+def verify_claim(claim: str, evidence_items: List[EvidenceItem], top_k: int = 5) -> Dict[str, Any]:
+    """Verify a claim using NLI on the provided evidence chunks.
+
+    `evidence_items` should be pre-ranked chunks (e.g., from retriever.retrieve_relevant_context).
+    """
+    if not evidence_items:
+        return VerificationResult(verdict="UNVERIFIED", confidence=0, explanation="No supporting evidence found.").model_dump()
+
+    # Limit to top_k provided
+    candidates = evidence_items[:top_k]
+
+    scored: List[EvidenceItem] = []
+    for item in candidates:
+        scores = _score_with_nli(claim, item)
+        # merge scores into item
+        updated = item.model_copy(update={
+            "entailment_score": float(scores.get("entailment_score", 0.0)),
+            "contradiction_score": float(scores.get("contradiction_score", 0.0)),
+            "nli_label": scores.get("nli_label", ""),
+            "nli_scores": scores.get("nli_scores", {}),
+            "verification_mode": scores.get("verification_mode", "nli"),
+        })
+        scored.append(updated)
+
+    # Aggregation: average support and contradiction across the top evidence
+    support_avg = sum(item.entailment_score for item in scored) / len(scored)
+    contradiction_avg = sum(item.contradiction_score for item in scored) / len(scored)
+    avg_relevance = sum(item.relevance_score for item in scored) / len(scored)
+
+    # Verdict rules
+    if support_avg > 0.80 and support_avg > contradiction_avg + 0.15:
+        verdict = "TRUE"
+    elif contradiction_avg > 0.80 and contradiction_avg > support_avg + 0.15:
+        verdict = "FALSE"
+    else:
+        verdict = "MISLEADING"
+
+    # Confidence scoring: weighted combination
+    confidence = int(round(100 * (support_avg * 0.6 + avg_relevance * 0.3 + 0.1 * 0.0)))
+
+    logger.info("verify_claim verdict=%s support=%.3f contradiction=%.3f avg_rel=%.3f", verdict, support_avg, contradiction_avg, avg_relevance)
+
+    return VerificationResult(
+        verdict=verdict,
+        confidence=max(0, min(100, confidence)),
+        explanation="",
+        verification_mode=(scored[0].verification_mode if scored else "nli"),
+        similarity_score=avg_relevance,
+        entailment_score=support_avg,
+        contradiction_score=contradiction_avg,
+        credibility_score=0.0,
+        nli_label=(scored[0].nli_label if scored else ""),
+        nli_scores=(scored[0].nli_scores if scored else {}),
+        evidence=scored,
+    ).model_dump()
+
+#main.py
+from fastapi import FastAPI
+from app.routes import router
+
+app = FastAPI(
+    title="Live Fact Checker"
+)
+
+app.include_router(router)
+
+GEMINI_API_KEY=" "
+TAVILY_API_KEY=""
+HF_TOKEN=""
+DEFAULT_NLI_MODEL = os.getenv("NLI_MODEL_NAME", "facebook/bart-large-mnli")
